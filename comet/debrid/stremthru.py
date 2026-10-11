@@ -1,4 +1,5 @@
 import asyncio
+import time
 from urllib.parse import quote, unquote
 
 import aiohttp
@@ -74,6 +75,13 @@ def _prepare_cached_torrents(responses, *, is_offcloud: bool):
             )
 
     return prepared, filenames
+
+
+# Accounts the store confirmed as premium, by store name and token, until the
+# monotonic time stored. The check is a store round trip of its own, and a
+# subscription does not lapse between two requests a few seconds apart.
+_PREMIUM_STATUS_TTL = 300
+_premium_verified_until: dict[tuple[str, str], float] = {}
 
 
 class StremThru:
@@ -219,6 +227,9 @@ class StremThru:
             )
 
     async def check_premium(self):
+        key = (self.store_name, self.store_token)
+        if _premium_verified_until.get(key, 0) > time.monotonic():
+            return
         try:
             async with self.session.get(
                 f"{self.base_url}/user?client_ip={self.client_ip}",
@@ -237,6 +248,7 @@ class StremThru:
                     self.store_name,
                     f"{self.store_name}: No active subscription.\nPlease renew your debrid account.",
                 )
+            _premium_verified_until[key] = time.monotonic() + _PREMIUM_STATUS_TTL
         except DebridAuthError:
             raise
         except Exception as e:
@@ -278,19 +290,18 @@ class StremThru:
         sources_map: dict,
         target_air_date: str | None = None,
     ):
-        await self.check_premium()
-
         chunk_size = 500
         chunks = [
             torrent_hashes[i : i + chunk_size]
             for i in range(0, len(torrent_hashes), chunk_size)
         ]
 
-        tasks = []
-        for chunk in chunks:
-            tasks.append(self.get_instant(chunk))
-
-        responses = await asyncio.gather(*tasks)
+        # The account check and the availability lookups are independent store
+        # round trips, so they go out together; a failed check still fails the
+        # whole call.
+        _, *responses = await asyncio.gather(
+            self.check_premium(), *(self.get_instant(chunk) for chunk in chunks)
+        )
 
         is_offcloud = self.store_name == "offcloud"
         cached_torrents, filenames_to_parse = _prepare_cached_torrents(

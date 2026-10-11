@@ -1,6 +1,8 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from comet.debrid import stremthru
 from comet.debrid.exceptions import DebridAuthError, DebridLinkGenerationError
 from comet.debrid.stremthru import (
     StremThru,
@@ -142,3 +144,80 @@ class StremThruResponseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.payload["error_type"], "RuntimeError")
         self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+
+
+class _CountingSession:
+    def __init__(self, payload):
+        self.payload = payload
+        self.urls = []
+
+    def get(self, url, *args, **kwargs):
+        del args, kwargs
+        self.urls.append(url)
+        return _ResponseContext(self.payload)
+
+
+class StremThruPremiumCheckTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        stremthru._premium_verified_until.clear()
+
+    async def test_premium_status_is_reused_for_the_same_account(self):
+        session = _CountingSession({"data": {"subscription_status": "premium"}})
+
+        await StremThru(session, None, None, "torbox:token", "").check_premium()
+        await StremThru(session, None, None, "torbox:token", "").check_premium()
+        await StremThru(session, None, None, "torbox:other", "").check_premium()
+
+        self.assertEqual(len(session.urls), 2)
+
+    async def test_failed_premium_check_is_not_reused(self):
+        session = _CountingSession({"data": {"subscription_status": "expired"}})
+
+        for _ in range(2):
+            with self.assertRaises(DebridAuthError):
+                await StremThru(session, None, None, "torbox:token", "").check_premium()
+
+        self.assertEqual(len(session.urls), 2)
+
+    async def test_premium_check_and_availability_lookups_run_together(self):
+        client = StremThru(None, None, None, "torbox:token", "")
+        both_started = asyncio.Event()
+        started = []
+
+        async def premium():
+            started.append("premium")
+            if len(started) == 2:
+                both_started.set()
+            await both_started.wait()
+
+        async def instant(chunk):
+            del chunk
+            started.append("instant")
+            if len(started) == 2:
+                both_started.set()
+            await both_started.wait()
+            return None
+
+        with (
+            patch.object(client, "check_premium", new=premium),
+            patch.object(client, "get_instant", new=instant),
+        ):
+            await asyncio.wait_for(
+                client.get_availability(["a" * 40], {}, {}, {}), timeout=1
+            )
+
+        self.assertCountEqual(started, ["premium", "instant"])
+
+    async def test_failed_premium_check_fails_the_availability_call(self):
+        client = StremThru(None, None, None, "torbox:token", "")
+
+        with (
+            patch.object(
+                client,
+                "check_premium",
+                new=AsyncMock(side_effect=DebridAuthError("torbox", "expired")),
+            ),
+            patch.object(client, "get_instant", new=AsyncMock(return_value=None)),
+            self.assertRaises(DebridAuthError),
+        ):
+            await client.get_availability(["a" * 40], {}, {}, {})
