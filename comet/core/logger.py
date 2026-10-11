@@ -423,6 +423,11 @@ def log_startup_info(settings):
         f"live={settings.LIVE_SCRAPE_TIMEOUT:g}s, "
         f"background={settings.BACKGROUND_SCRAPE_TIMEOUT:g}s",
     )
+    if settings.LIVE_SCRAPE_RESPONSE_DEADLINE is not None:
+        logger.log(
+            "COMET",
+            f"Live Response Deadline: {settings.LIVE_SCRAPE_RESPONSE_DEADLINE:g}s",
+        )
     if settings.SCRAPER_TIMEOUT_OVERRIDES:
         overrides = ", ".join(
             f"{selector}={timeout:g}s"

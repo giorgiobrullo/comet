@@ -556,12 +556,33 @@ async def search_media(
             session,
         )
 
+    async def cache_late_availability(late_torrents: dict):
+        # Torrents from scrapers that missed the live response deadline: the
+        # next request takes them from the torrent cache as already known, so
+        # their debrid availability is cached now, as a background scrape does.
+        await get_and_cache_multi_service_availability(
+            session,
+            debrid_entries,
+            late_torrents,
+            media_id,
+            media_only_id,
+            search_season,
+            search_episode,
+            media_scope,
+            ip,
+            target_air_date=target_air_date,
+        )
+
+    on_late_torrents = cache_late_availability if debrid_entries else None
+
     if cache_result.should_scrape_now or force_scrape_now:
         logger.log("SCRAPER", f"🔎 Starting new search for {log_title}")
         try:
             if use_account_scrape:
                 scrape_result, warmup_result = await asyncio.gather(
-                    torrent_manager.scrape_torrents(ScrapeContext.LIVE),
+                    torrent_manager.scrape_torrents(
+                        ScrapeContext.LIVE, on_late_torrents
+                    ),
                     ensure_account_snapshot_ready(session, debrid_entries, ip),
                     return_exceptions=True,
                 )
@@ -571,7 +592,9 @@ async def search_media(
                     raise warmup_result
                 account_snapshot_ready = True
             else:
-                await torrent_manager.scrape_torrents(ScrapeContext.LIVE)
+                await torrent_manager.scrape_torrents(
+                    ScrapeContext.LIVE, on_late_torrents
+                )
             await _mark_scope_scraped_if_populated(media_id, torrent_manager.torrents)
             logger.log(
                 "SCRAPER",

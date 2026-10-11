@@ -46,6 +46,18 @@ Without an explicit override, Jackett and Prowlarr also reserve
 `INDEXER_MANAGER_WAIT_TIMEOUT` for cold indexer-manager initialization before
 their context-specific scrape budget begins.
 
+A per-scraper timeout drops whatever a slow scraper would have found. To keep
+those results without making the request wait for them, set
+`LIVE_SCRAPE_RESPONSE_DEADLINE` (seconds, unset by default): a live request
+answers at the deadline with the torrents found so far, and the scrapers still
+running carry on in the background up to their own timeout. Their torrents go
+to the torrent cache, and their debrid availability to the debrid cache, so
+the next request for the same title has them.
+
+```env
+LIVE_SCRAPE_RESPONSE_DEADLINE=4
+```
+
 `HTTP_CLIENT_TIMEOUT_TOTAL` remains the timeout for one HTTP request. Scraper
 budgets cover the complete provider operation, including pagination and retries.
 
