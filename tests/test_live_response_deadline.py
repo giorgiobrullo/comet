@@ -1,5 +1,8 @@
 import asyncio
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from comet.core.models import AppSettings
@@ -41,6 +44,7 @@ class LiveResponseDeadlineTests(unittest.IsolatedAsyncioTestCase):
         self.release_slow = asyncio.Event()
         self.slow_done = asyncio.Event()
         self.cached = []
+        self.filtered = []
 
     async def scrapers(self, request):
         del request
@@ -57,7 +61,10 @@ class LiveResponseDeadlineTests(unittest.IsolatedAsyncioTestCase):
             batch = manager.ready_to_cache if torrents is None else torrents
             self.cached.append([torrent["infoHash"] for torrent in batch])
 
-        async def filter_manager(scraper_name, torrents, response_time=None):
+        async def filter_manager(
+            scraper_name, torrents, response_time=None, one_chunk_at_a_time=False
+        ):
+            self.filtered.append((scraper_name, one_chunk_at_a_time))
             await self.filter_manager(manager, scraper_name, torrents, response_time)
 
         return (
@@ -88,6 +95,7 @@ class LiveResponseDeadlineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.cached, [["fast"], ["slow"]])
         self.assertEqual(late, [["slow"]])
+        self.assertEqual(self.filtered, [("Fast", False), ("Slow", True)])
         self.assertEqual(list(manager.torrents), ["fast"])
         self.assertEqual(orchestration._late_collections, set())
 
@@ -164,3 +172,43 @@ class LiveResponseDeadlineSettingTests(unittest.TestCase):
         for value in ("0", -1, "nan"):
             with self.assertRaises(ValueError):
                 AppSettings.validate_live_scrape_response_deadline(value)
+
+
+class LateFilteringTests(unittest.IsolatedAsyncioTestCase):
+    async def run_filter(self, one_chunk_at_a_time):
+        manager = make_manager()
+        running = 0
+        most_running = 0
+        lock = threading.Lock()
+
+        def fake_filter_worker(chunk, *args):
+            nonlocal running, most_running
+            with lock:
+                running += 1
+                most_running = max(most_running, running)
+            time.sleep(0.02)
+            with lock:
+                running -= 1
+            return chunk
+
+        torrents = [scraped(f"{i:040x}") for i in range(100)]
+        with (
+            ThreadPoolExecutor(max_workers=8) as executor,
+            patch("comet.services.orchestration.get_executor", return_value=executor),
+            patch("comet.services.orchestration.filter_worker", new=fake_filter_worker),
+            patch(
+                "comet.services.orchestration._is_current_scrape_result",
+                return_value=True,
+            ),
+        ):
+            await manager.filter_manager(
+                "Late", torrents, one_chunk_at_a_time=one_chunk_at_a_time
+            )
+        self.assertEqual(len(manager.ready_to_cache), 100)
+        return most_running
+
+    async def test_late_results_take_one_executor_slot_at_a_time(self):
+        self.assertEqual(await self.run_filter(one_chunk_at_a_time=True), 1)
+
+    async def test_results_for_a_waiting_response_use_the_whole_executor(self):
+        self.assertGreater(await self.run_filter(one_chunk_at_a_time=False), 1)
