@@ -218,7 +218,12 @@ class TorrentManager:
         async for scraper_name, results, response_time in scraper_manager.scrape_all(
             request
         ):
-            await self.filter_manager(scraper_name, results, response_time)
+            # Once the response is out, late results are filtered a chunk at a
+            # time: the executor is shared, and a burst of late chunks would
+            # queue ahead of the work of requests still waiting for an answer.
+            await self.filter_manager(
+                scraper_name, results, response_time, one_chunk_at_a_time=self.answered
+            )
             self.finished_scrapers += 1
 
         # Whatever the response did not already cache. Both the slice and the
@@ -430,6 +435,7 @@ class TorrentManager:
         scraper_name: str,
         torrents: object,
         response_time: float | None = None,
+        one_chunk_at_a_time: bool = False,
     ):
         timing = f" Took {response_time:.2f}s." if response_time is not None else ""
         if not isinstance(torrents, list):
@@ -472,11 +478,12 @@ class TorrentManager:
 
         loop = asyncio.get_running_loop()
         chunk_size = 20
-        tasks = [
-            loop.run_in_executor(
+
+        def filter_chunk(start: int):
+            return loop.run_in_executor(
                 get_executor(),
                 filter_worker,
-                new_torrents[i : i + chunk_size],
+                new_torrents[start : start + chunk_size],
                 self.title,
                 self.year,
                 self.year_end,
@@ -484,9 +491,12 @@ class TorrentManager:
                 self.aliases,
                 self.remove_adult_content,
             )
-            for i in range(0, len(new_torrents), chunk_size)
-        ]
-        results = await asyncio.gather(*tasks)
+
+        starts = range(0, len(new_torrents), chunk_size)
+        if one_chunk_at_a_time:
+            results = [await filter_chunk(start) for start in starts]
+        else:
+            results = await asyncio.gather(*(filter_chunk(start) for start in starts))
         for result in results:
             self.ready_to_cache.extend(result)
 
