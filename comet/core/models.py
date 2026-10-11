@@ -72,6 +72,7 @@ _POSITIVE_WORK_COUNT_FIELDS = (
     "BACKGROUND_SCRAPER_CONCURRENT_WORKERS",
     "FILTER_PARSE_CACHE_SHARDS",
 )
+METADATA_CACHE_TTL_FOREVER = 100 * 365 * 24 * 3600
 _SCRAPE_TIMEOUT_FIELDS = (
     "LIVE_SCRAPE_TIMEOUT",
     "BACKGROUND_SCRAPE_TIMEOUT",
@@ -467,6 +468,17 @@ class AppSettings(ServerSettings):
         if value is None or (isinstance(value, str) and not value.strip()):
             return None
         return cls._normalize_scrape_timeout(value)
+
+    @field_validator("METADATA_CACHE_TTL")
+    def validate_metadata_cache_ttl(cls, value):
+        # A negative TTL keeps metadata forever, as it does for the torrent TTLs.
+        # Every freshness check and cleanup subtracts the TTL from the current
+        # time, where a negative one would put the cutoff in the future: fresh
+        # metadata would read as expired, each lookup would fail, and every
+        # startup would wipe the cache. A century is forever for all of them.
+        if value is not None and value < 0:
+            return METADATA_CACHE_TTL_FOREVER
+        return value
 
     @field_validator("SCRAPER_TIMEOUT_OVERRIDES", mode="before")
     def normalize_scraper_timeout_overrides(cls, value):
