@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, patch
 from databases import Database
 
 from comet.core.db_router import ReplicaAwareDatabase
-from comet.core.models import settings
+from comet.core.models import (
+    METADATA_CACHE_TTL_FOREVER,
+    AppSettings,
+    settings,
+)
 from comet.metadata.manager import (
     MetadataScraper,
     _alias_cache_timestamp,
@@ -260,3 +264,36 @@ class MetadataRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.metadata_calls, 0)
         self.assertEqual(state.alias_calls, 1)
         self.assertEqual(state.cache_calls, 1)
+
+
+class MetadataCacheForeverTests(unittest.TestCase):
+    def test_negative_ttl_keeps_fresh_metadata_and_retries_failed_aliases(self):
+        ttl = AppSettings(_env_file=None, METADATA_CACHE_TTL=-1).METADATA_CACHE_TTL
+        self.assertEqual(ttl, METADATA_CACHE_TTL_FOREVER)
+
+        current_time = time.time()
+        scraper = MetadataScraper(session=None)
+        with patch.object(settings, "METADATA_CACHE_TTL", ttl):
+            just_cached = scraper._build_cache_entry(
+                {
+                    "title": "Movie",
+                    "year": 2026,
+                    "year_end": None,
+                    "metadata_updated_at": current_time,
+                    "aliases_json": '{"us": ["Movie"]}',
+                    "aliases_updated_at": current_time,
+                },
+                None,
+                None,
+                current_time,
+            )
+            failed_at = _alias_cache_timestamp(current_time, succeeded=False)
+
+            self.assertEqual(just_cached.metadata["title"], "Movie")
+            self.assertEqual(just_cached.aliases, {"us": ["Movie"]})
+            self.assertFalse(scraper._is_fresh(failed_at, current_time + 301))
+            self.assertTrue(scraper._is_fresh(failed_at, current_time + 299))
+
+    def test_positive_ttl_is_unchanged(self):
+        settings_ = AppSettings(_env_file=None, METADATA_CACHE_TTL=86400)
+        self.assertEqual(settings_.METADATA_CACHE_TTL, 86400)
