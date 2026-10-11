@@ -179,6 +179,7 @@ class AppSettings(ServerSettings):
     SCRAPE_LOCK_TTL: int | None = 300  # 5 minutes
     LIVE_SCRAPE_TIMEOUT: float = 30.0
     BACKGROUND_SCRAPE_TIMEOUT: float = 30.0
+    LIVE_SCRAPE_RESPONSE_DEADLINE: float | None = None
     SCRAPER_TIMEOUT_OVERRIDES: dict[str, float] = Field(default_factory=dict)
     INDEXER_MANAGER_TYPE: str | None = None
     INDEXER_MANAGER_URL: str | None = "http://127.0.0.1:9117"
@@ -459,6 +460,12 @@ class AppSettings(ServerSettings):
 
     @field_validator(*_SCRAPE_TIMEOUT_FIELDS, mode="before")
     def validate_scrape_timeout(cls, value):
+        return cls._normalize_scrape_timeout(value)
+
+    @field_validator("LIVE_SCRAPE_RESPONSE_DEADLINE", mode="before")
+    def validate_live_scrape_response_deadline(cls, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
         return cls._normalize_scrape_timeout(value)
 
     @field_validator("SCRAPER_TIMEOUT_OVERRIDES", mode="before")

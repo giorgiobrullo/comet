@@ -144,7 +144,8 @@ class TorrentOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             if False:
                 yield None
 
-        async def cache_torrents():
+        async def cache_torrents(torrents=None):
+            del torrents
             cache_started.set()
             await release_cache.wait()
 

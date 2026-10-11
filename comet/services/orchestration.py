@@ -56,6 +56,25 @@ def _is_current_scrape_result(torrent: object) -> bool:
     )
 
 
+# Scrapes still running after their live response went out. Holding them here
+# keeps them from being garbage collected half way.
+_late_collections: set[asyncio.Task] = set()
+
+
+def _detach_late_collection(task: asyncio.Task):
+    _late_collections.add(task)
+    task.add_done_callback(_finish_late_collection)
+
+
+def _finish_late_collection(task: asyncio.Task):
+    _late_collections.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(f"Background part of a live scrape failed: {exc}")
+
+
 class TorrentManager:
     def __init__(
         self,
@@ -108,6 +127,9 @@ class TorrentManager:
         self.ranked_torrents = {}
         self.primary_cached = False
         self.live_result_timestamp = time.time()
+        self.cached_count = 0
+        self.finished_scrapers = 0
+        self.answered = False
 
     def _matches_requested_scope(
         self,
@@ -133,6 +155,7 @@ class TorrentManager:
     async def scrape_torrents(
         self,
         context: ScrapeContext,
+        on_late_torrents=None,
     ):
         request = ScrapeRequest(
             media_type=self.media_type,
@@ -158,19 +181,28 @@ class TorrentManager:
             f"🔤 Indexer titles ({len(request.query_titles)}): {titles}",
         )
 
-        async for scraper_name, results, response_time in scraper_manager.scrape_all(
-            request
-        ):
-            await self.filter_manager(scraper_name, results, response_time)
+        deadline = (
+            settings.LIVE_SCRAPE_RESPONSE_DEADLINE
+            if context == ScrapeContext.LIVE
+            else None
+        )
+        if deadline is None:
+            await self._collect_and_cache(request)
+            collected = self.ready_to_cache
+        else:
+            collected = await self._collect_until_deadline(
+                request, deadline, on_late_torrents
+            )
 
-        await self.cache_torrents()
+        self.torrents.update(self._scoped_torrents(collected))
 
-        for torrent in self.ready_to_cache:
+    def _scoped_torrents(self, scraped: list) -> dict:
+        torrents = {}
+        for torrent in scraped:
             if not self._matches_requested_scope(torrent["parsed"]):
                 continue
 
-            info_hash = torrent["infoHash"]
-            self.torrents[info_hash] = {
+            torrents[torrent["infoHash"]] = {
                 "fileIndex": torrent["fileIndex"],
                 "title": torrent["title"],
                 "seeders": torrent["seeders"],
@@ -180,6 +212,74 @@ class TorrentManager:
                 "parsed": torrent["parsed"],
                 "updatedAt": self.live_result_timestamp,
             }
+        return torrents
+
+    async def _collect_and_cache(self, request: ScrapeRequest, on_late_torrents=None):
+        async for scraper_name, results, response_time in scraper_manager.scrape_all(
+            request
+        ):
+            await self.filter_manager(scraper_name, results, response_time)
+            self.finished_scrapers += 1
+
+        # Whatever the response did not already cache. Both the slice and the
+        # new mark are taken before the await, so nothing is cached twice.
+        pending = self.ready_to_cache[self.cached_count :]
+        late = self.answered
+        self.cached_count = len(self.ready_to_cache)
+        await self.cache_torrents(pending)
+
+        if late:
+            logger.log(
+                "SCRAPER",
+                f"📥 Late scrapers for {self.media_id} finished: "
+                f"{len(pending)} more torrents cached",
+            )
+            if on_late_torrents is not None:
+                late_torrents = self._scoped_torrents(pending)
+                if late_torrents:
+                    await on_late_torrents(late_torrents)
+
+    async def _collect_until_deadline(
+        self, request: ScrapeRequest, deadline: float, on_late_torrents=None
+    ) -> list:
+        """Answer with what the scrapers found by the deadline.
+
+        A slow scraper (an indexer manager waiting on its indexers) no longer
+        holds the response: it keeps running, and what it finds afterwards goes
+        to the torrent cache, where the next request for the title finds it.
+        on_late_torrents receives those late torrents (in the shape of
+        self.torrents), so their debrid availability can be cached as well.
+        """
+        collection = asyncio.create_task(
+            self._collect_and_cache(request, on_late_torrents)
+        )
+        try:
+            await asyncio.wait_for(asyncio.shield(collection), deadline)
+            return self.ready_to_cache
+        except TimeoutError:
+            if collection.done():
+                # Finished right at the deadline, or failed with its own timeout.
+                collection.result()
+                return self.ready_to_cache
+            _detach_late_collection(collection)
+        except asyncio.CancelledError:
+            # The request went away; the scrape still fills the cache.
+            self.answered = True
+            _detach_late_collection(collection)
+            raise
+
+        self.answered = True
+        collected = list(self.ready_to_cache)
+        self.cached_count = len(collected)
+        logger.log(
+            "SCRAPER",
+            f"⏱️ Live response deadline ({deadline:g}s) reached for {self.media_id}: "
+            f"answering with {len(collected)} torrents from "
+            f"{self.finished_scrapers} finished scrapers, the rest continue "
+            "in the background",
+        )
+        await self.cache_torrents(collected)
+        return collected
 
     async def _fetch_cached_rows(self, media_id: str):
         where_clause, params = build_torrent_cache_where(
@@ -317,9 +417,9 @@ class TorrentManager:
                 }
             )
 
-    async def cache_torrents(self):
+    async def cache_torrents(self, torrents: list | None = None):
         file_infos = []
-        for torrent in self.ready_to_cache:
+        for torrent in self.ready_to_cache if torrents is None else torrents:
             self._append_cache_file_infos(file_infos, torrent)
 
         if file_infos:
