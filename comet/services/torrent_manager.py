@@ -357,7 +357,9 @@ async def download_torrent(session, url: str):
             return (None, None, None)
     except Exception as e:
         logger.debug(
-            f"Failed to download torrent from {url}: {e} (in most cases, you can ignore this error)"
+            # Without the query string: indexer manager links carry their API key.
+            f"Failed to download torrent from {url.split('?', 1)[0]}: {e} "
+            "(in most cases, you can ignore this error)"
         )
         return (None, None, None)
 
